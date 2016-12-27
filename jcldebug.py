@@ -23,6 +23,7 @@
 import struct
 import ctypes
 import numpy
+from collections import namedtuple
 
 
 class JclBinDebugScanner:
@@ -30,17 +31,20 @@ class JclBinDebugScanner:
     JCL_DBG_DATA_SIGNATURE = 0x4742444A
     JCL_DBG_HEADER_VERSION = b'\x01'
 
+    JclBinDbgNameCache = namedtuple("JclBinDbgNameCache", "addr first_word second_word")
+    # VA relative to(module base address + $10000)
+    JclMapLineNumber = namedtuple("JclMapLineNumber", "segment va line_number")
+
     cache_data = False
     valid_format = False
+    line_numbers_cache = []
+    proc_names_cache = []
 
     def check_format(self):
+        # remove
+        # return
+
         index = 0
-
-        self.signature, self.version, self.units, self.source_names, self.symbols, self.line_numbers, self.words, self.module_name, self.check_sum, self.check_sum_valid = struct.unpack_from(
-            self.JCL_DBG_HEADER, self.stream, index)
-
-#remove
-#        return
 
         header_size = struct.calcsize(self.JCL_DBG_HEADER)
         data_size = len(self.stream)
@@ -62,9 +66,15 @@ class JclBinDebugScanner:
             file_check_sum = (0xFFFFFF & (file_check_sum >> 8)) | (file_check_sum << 24)
             self.valid_format = file_check_sum == self.check_sum
 
-    def __init__(self, stream, cache_data):
+    def __init__(self, stream, cache_data, name):
         self.stream = stream
         self.cache_data = cache_data
+        self.name = name
+
+        self.signature, self.version, self.units, self.source_names, self.symbols, self.line_numbers, self.words, \
+            self.module_name, self.check_sum, self.check_sum_valid = struct.unpack_from(self.JCL_DBG_HEADER,
+                                                                                        self.stream)
+
         self.check_format()
 
     #
@@ -101,7 +111,7 @@ class JclBinDebugScanner:
         index = addr
         p = self.stream[index]
         if p == 1:
-            return self.simple_crypt_string(self.stream[index + 1 : len(self.stream)])
+            return self.simple_crypt_string(self.stream[index + 1: len(self.stream)])
         elif p == 2:
             addr += 1
             buffer.append('@')
@@ -141,10 +151,9 @@ class JclBinDebugScanner:
             b += 1
             i += 1
 
-        #buffer.append(0)
         return buffer.decode(encoding='UTF-8')
 
-    def read_value(self, p, value):
+    def read_value(self, p):
         n = 0
         i = 0
         b = 0x80
@@ -162,31 +171,28 @@ class JclBinDebugScanner:
     def module_start_from_addr(self, addr):
         p = self.units
         start_addr = 0
-        module_start_addr = ctypes.c_uint32(-1); #DWORD(-1)
-        value = ctypes.c_uint32(0)
+        module_start_addr = ctypes.c_uint32(-1)  # DWORD(-1)
 
-        res, p, value = self.read_value(p, value)
+        res, p, value = self.read_value(p)
         while res:
             start_addr += value
             if addr < start_addr:
                 break
             else:
-                res, p, value = self.read_value(p, value)
+                res, p, value = self.read_value(p)
                 module_start_addr = start_addr
 
-            res, p, value = self.read_value(p, value)
+            res, p, value = self.read_value(p)
 
         return module_start_addr
 
     def line_number_from_addr(self, addr):
-        module_start_va = self.module_start_from_addr(addr);
+        module_start_va = self.module_start_from_addr(addr)
         line_number = 0
         offset = 0
-        value = 0
         if self.cache_data:
-            # todo: implement
-            # cache_line_number()
-            for value in reversed(self.line_numbers):
+            self.cache_line_number()
+            for value in reversed(self.line_numbers_cache):
                 if value.va <= addr:
                     if value.va >= module_start_va:
                         line_number = value.line_number
@@ -197,7 +203,7 @@ class JclBinDebugScanner:
             p = self.line_numbers
             curr_va = 0
             item_va = 0
-            res, p, value = self.read_value(p, value)
+            res, p, value = self.read_value(p)
             while res:
                 curr_va += value
                 if addr < curr_va:
@@ -208,11 +214,11 @@ class JclBinDebugScanner:
                     break
                 else:
                     item_va = curr_va
-                    res, p, value = self.read_value(p, value)
+                    res, p, value = self.read_value(p)
                     line_number += value
                     offset = addr - curr_va
 
-                res, p, value = self.read_value(p, value)
+                res, p, value = self.read_value(p)
 
         return line_number, offset
 
@@ -220,8 +226,8 @@ class JclBinDebugScanner:
         if a == 0:
             return r''
 
-        p = a + self.words - 1;
-        return self.decode_name_string(p);
+        p = a + self.words - 1
+        return self.decode_name_string(p)
 
     def source_name_from_addr(self, addr):
         module_start_addr = self.module_start_from_addr(addr)
@@ -230,9 +236,8 @@ class JclBinDebugScanner:
         start_addr = 0
         item_addr = 0
         found = False
-        value = 0
 
-        res, p, value = self.read_value(p, value)
+        res, p, value = self.read_value(p)
         while res:
             start_addr += value
             if addr < start_addr:
@@ -243,10 +248,10 @@ class JclBinDebugScanner:
                 break
             else:
                 item_addr = start_addr
-                res, p, value = self.read_value(p, value)
+                res, p, value = self.read_value(p)
                 name += value
 
-            res, p, value = self.read_value(p, value)
+            res, p, value = self.read_value(p)
 
         if found:
             return self.data_to_str(name)
@@ -257,18 +262,17 @@ class JclBinDebugScanner:
         p = self.units
         name = 0
         start_addr = 0
-        value = 0
-        res, p, value = self.read_value(p, value)
+        res, p, value = self.read_value(p)
 
         while res:
             start_addr += value
             if addr < start_addr:
                 break
             else:
-                res, p, value = self.read_value(p, value)
+                res, p, value = self.read_value(p)
                 name += value
 
-            res, p, value = self.read_value(p, value)
+            res, p, value = self.read_value(p)
 
         return self.data_to_str(name)
 
@@ -278,9 +282,8 @@ class JclBinDebugScanner:
         second_word = 0
         offset = 0
         if self.cache_data:
-            # todo: implement
-            # cache_proc_names()
-            for value in reversed(self.proc_names):
+            self.cache_proc_names()
+            for value in reversed(self.proc_names_cache):
                 if value.addr <= addr:
                     if value.addr >= module_start_addr:
                         first_word = value.first_word
@@ -292,9 +295,8 @@ class JclBinDebugScanner:
             p = self.symbols
             curr_addr = 0
             item_addr = 0
-            value = 0
 
-            res, p, value = self.read_value(p, value)
+            res, p, value = self.read_value(p)
             while res:
                 curr_addr += value
                 if addr < curr_addr:
@@ -306,18 +308,53 @@ class JclBinDebugScanner:
                     break
                 else:
                     item_addr = curr_addr
-                    res, p, value = self.read_value(p, value)
+                    res, p, value = self.read_value(p)
                     first_word += value
-                    res, p, value = self.read_value(p, value)
+                    res, p, value = self.read_value(p)
                     second_word += value
                     offset = addr - curr_addr
 
-                res, p, value = self.read_value(p, value)
+                res, p, value = self.read_value(p)
 
-            result = ''
-            if first_word != 0:
-                result = self.data_to_str(first_word)
-                if second_word != 0:
-                    result += '.' + self.data_to_str(second_word)
+        result = ''
+        if first_word != 0:
+            result = self.data_to_str(first_word)
+            if second_word != 0:
+                result += '.' + self.data_to_str(second_word)
 
-            return result, offset
+        return result, offset
+
+    def cache_line_number(self):
+        if len(self.line_numbers_cache) == 0:
+            line_number = 0
+            curr_va = 0
+            p = self.line_numbers
+            res, p, value = self.read_value(p)
+            while res:
+                curr_va += value
+                res, p, value = self.read_value(p)
+                line_number += value
+
+                item = self.JclMapLineNumber(segment=0, va=curr_va, line_number=line_number)
+                self.line_numbers_cache.append(item)
+
+                res, p, value = self.read_value(p)
+
+    def cache_proc_names(self):
+        if len(self.proc_names_cache) == 0:
+            first_word = 0
+            second_word = 0
+            curr_addr = 0
+            p = self.symbols
+            res, p, value = self.read_value(p)
+            while res:
+                curr_addr += value
+                res, p, value = self.read_value(p)
+                first_word += value
+                res, p, value = self.read_value(p)
+                second_word += value
+
+                item = self.JclBinDbgNameCache(addr=curr_addr, first_word=first_word, second_word=second_word)
+                self.proc_names_cache.append(item)
+
+                res, p, value = self.read_value(p)
